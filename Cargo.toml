@@ -1,0 +1,12 @@
+[package]
+name = "punnel"
+version = "0.1.0"
+authors = ["br33d"]
+
+[dependencies]
+clap = "2.19.3"
+log = "0.3.6"
+futures = "0.1"
+tokio-core = "0.1"
+byteorder = "0.5.3"
+
