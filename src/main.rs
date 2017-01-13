@@ -7,8 +7,9 @@ use clap::{Arg, App, SubCommand};
 use futures::{Future, Sink};
 use futures::stream::Stream;
 use std::io::{self, Error, ErrorKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, Shutdown};
+use std::sync::{Arc};
 use tokio_core::io::{Io, Codec, Framed};
 use tokio_core::net::{TcpListener, TcpStream};
 use tokio_core::reactor::{Core, Handle};
@@ -20,25 +21,26 @@ use punnel_proto::{PunnelFrame, PunnelFrameCodec};
 type BoxedPunnelFrameSink = Box<Sink<SinkItem = PunnelFrame, SinkError = io::Error>>;
 type BoxedPunnelFrameStream = Box<Stream<Item = PunnelFrame, Error = io::Error>>;
 
-struct Connection {
-    id: u32,
-    framed: Rc<Framed<TcpStream, PunnelFrameCodec>>,
+struct ToBeAcked {
+    seq: u32,
+    buffer: Vec<u8>,
 }
 
-struct ConnectedConnection {
-    cnxn: Connection,
-    tunnel: Rc<Framed<TcpStream, PunnelFrameCodec>>,
-    handle: Rc<Handle>,
+struct Connection {
+    id: u32,
+    stream: Rc<TcpStream>,
+    last_ack: u32,
+    waiting_for_ack: VecDeque<ToBeAcked>,
 }
 
 struct ConnectionRegistry {
-    connections: HashMap<u32, Rc<Connection>>,
+    connections: HashMap<u32, Arc<Connection>>,
     next_key: u32,
 }
 
 impl ConnectionRegistry {
     // for use by the server to add a connection
-    fn register(&mut self, tcp_stream: TcpStream) -> Rc<Connection> {
+    fn register(&mut self, tcp_stream: TcpStream) -> Arc<Connection> {
         // id 0 is special (indicating no connection, so make sure to skip it
         while self.next_key != 0 && self.connections.contains_key(&self.next_key) {
             self.next_key += 1
@@ -50,48 +52,75 @@ impl ConnectionRegistry {
     }
 
     // for use by the client to add a connection
-    fn add(&mut self, id: u32, tcp_stream: TcpStream) -> Rc<Connection> {
+    fn add(&mut self, id: u32, tcp_stream: TcpStream) -> Arc<Connection> {
         let cnxn = Connection {
             id: id,
-            framed: Rc::new(tcp_stream.framed(PunnelFrameCodec)),
+            stream: Rc::new(tcp_stream),
+            last_ack: 0,
+            waiting_for_ack: VecDeque::new(),
         };
 
-        let rc_cnxn = Rc::new(cnxn);
+        let rc_cnxn = Arc::new(cnxn);
         self.connections.insert(id, rc_cnxn.clone());
         rc_cnxn
     }
 
-    fn get_connection(&self, id: u32) -> Option<&Rc<Connection>> {
+    fn get_connection(&self, id: u32) -> Option<&Arc<Connection>> {
         self.connections.get(&id)
     }
 
     fn close(&mut self, id: u32) {
         if let Some(cnxn) = self.connections.remove(&id) {
-            cnxn.framed.get_ref().shutdown(Shutdown::Both);
+            // todo close connection
         }
     }
 }
 
+struct ConnectedConnection {
+    registry: Rc<ConnectionRegistry>,
+    tunnel_sink: BoxedPunnelFrameSink,
+    tunnel_stream: BoxedPunnelFrameStream,
+    handle: Arc<Handle>,
+}
+
 impl ConnectedConnection {
-    fn new(cnxn: Connection,
-           tunnel: Rc<Framed<TcpStream, PunnelFrameCodec>>,
-           handle: Rc<Handle>)
+    fn new(registry: Rc<ConnectionRegistry>,
+           tunnel_sink: BoxedPunnelFrameSink,
+           tunnel_stream: BoxedPunnelFrameStream,
+           handle: Arc<Handle>)
            -> ConnectedConnection {
         ConnectedConnection {
-            cnxn: cnxn,
-            tunnel: tunnel,
+            registry: registry,
+            tunnel_sink: tunnel_sink,
+            tunnel_stream: tunnel_stream,
             handle: handle,
         }
     }
 
-    fn tunnel(&self) -> Result<(), io::Error> {
-        self.handle.spawn(self.tunnel.and_then(|connect_frame| {
+    fn tunnel(self) -> Result<(), io::Error> {
+        let registry = &self.registry;
+
+        let stream = self.tunnel_stream.and_then(|connect_frame| {
             if let PunnelFrame::Connect { id, seq } = connect_frame {
-                Ok(())
+                if id == 0 {
+                    // create a new connection
+                    //Ok(create_new_connection())
+                    Err(Error::new(ErrorKind::InvalidInput, "Expected connect"))
+                } else {
+                    // find an existing connection
+                    match registry.get_connection(id) {
+                        Some(cnxn) => Ok((cnxn, seq)),
+                        None => Err(Error::new(ErrorKind::InvalidInput, "invalid id")),
+                    }
+                }
             } else {
-                return Err(Error::new(ErrorKind::InvalidInput, "Expected connect"));
+                 Err(Error::new(ErrorKind::InvalidInput, "Expected connect"))
             }
-        }));
+        }).and_then(|(cnxn, seq)| {
+            let write_stream = cnxn.clone();
+            let read_stream = cnxn.clone();
+            Ok(())
+        });
         Ok(())
     }
 }
@@ -102,17 +131,40 @@ fn get_inaddr_any() -> Ipv6Addr {
 
 fn do_client(local_port: SocketAddr, server_host_port: SocketAddr) {}
 
+struct IncomingConnection {
+    tunnel_sink: BoxedPunnelFrameSink,
+    tunnel_stream: BoxedPunnelFrameStream,
+}
+
+impl IncomingConnection {
+    fn process(self) {
+        self.tunnel_stream.and_then(|p| {
+            if let PunnelFrame::Connect{id, seq} = p {
+                if id == 0 {
+                    // create a new session
+                } else {
+                    // reconnect
+                }
+                Ok(())
+            } else {
+                Err(Error::new(ErrorKind::InvalidInput, "Expected connect"))
+            }
+        });
+    }
+}
+
 fn do_server(connect_to_port: SocketAddr) {
     let mut core = Core::new().unwrap();
-    let handle = Rc::new(core.handle());
+    let handle = Arc::new(core.handle());
     let mut local_port: SocketAddr = SocketAddr::V6(SocketAddrV6::new(get_inaddr_any(), 0, 0, 0));
     let acceptor = TcpListener::bind(&local_port, &handle)
         .and_then(move |listener| {
-            Ok(listener.incoming().for_each(move |(cnxn, addr)| {
-                println!("got connection from {}", addr);
+            Ok(listener.incoming().for_each(|(cnxn, addr)| {
                 let (sink, stream) = cnxn.framed(PunnelFrameCodec).split();
-                // let t = TunnelConnection::new(Box::new(sink), Box::new(stream), handle.clone());
-                // t.connect(connect_to_port);
+                IncomingConnection {
+                    tunnel_sink: Box::new(sink),
+                    tunnel_stream: Box::new(stream),
+                }.process();
                 Ok(())
             }))
         })
@@ -121,7 +173,7 @@ fn do_server(connect_to_port: SocketAddr) {
 }
 
 fn main() {
-    let matches = App::new("persistent tunnel one local port to remote port")
+    let mut app = App::new("persistent tunnel one local port to remote port")
         .version("1.0")
         .subcommand(SubCommand::with_name("client")
             .about("start client and connect to server")
@@ -138,15 +190,19 @@ fn main() {
             .arg(Arg::with_name("connectToPort")
                 .help("port to connect to")
                 .index(1)
-                .required(true)))
-        .get_matches();
+                .required(true)));
+    let matches = app.clone().get_matches();
 
-    if let Some(sub_matches) = matches.subcommand_matches("client") {
-        let local_port = matches.value_of("localPort").unwrap().parse().unwrap();
-        let server_host_port = matches.value_of("serverHostPort").unwrap().parse().unwrap();
-        do_client(local_port, server_host_port);
-    } else if let Some(sub_matches) = matches.subcommand_matches("server") {
-        let connect_to_port = matches.value_of("connectToPort").unwrap().parse().unwrap();
-        do_server(connect_to_port);
+    match matches.subcommand() {
+        ("client", Some(sub_matches)) => {
+            let local_port = matches.value_of("localPort").unwrap().parse().unwrap();
+            let server_host_port = matches.value_of("serverHostPort").unwrap().parse().unwrap();
+            do_client(local_port, server_host_port);
+        },
+        ("server", Some(sub_matches)) => {
+            let connect_to_port = matches.value_of("connectToPort").unwrap().parse().unwrap();
+            do_server(connect_to_port);
+        },
+        _ => { app.print_help(); }
     }
 }
